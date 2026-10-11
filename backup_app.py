@@ -16,7 +16,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 
-SETTINGS_FILE = Path.home() / ".incremental_backup_settings.json"
+SETTINGS_FILE = Path(__file__).resolve().parent / "config.json"
 
 
 @dataclass
@@ -47,6 +47,7 @@ class BackupApp(tk.Tk):
         self.source_var = tk.StringVar(value=settings.source)
         self.destination_var = tk.StringVar(value=settings.destination)
         self.status_var = tk.StringVar(value="请选择源文件夹和备份文件夹。")
+        self.progress_var = tk.DoubleVar(value=0)
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -66,13 +67,20 @@ class BackupApp(tk.Tk):
 
         self.backup_button = ttk.Button(frame, text="开始增量备份", command=self._start_backup)
         self.backup_button.grid(row=2, column=1, sticky="e", pady=(8, 14))
-        ttk.Label(frame, textvariable=self.status_var, wraplength=600).grid(row=3, column=0, columnspan=3, sticky="w")
+        self.progress_bar = ttk.Progressbar(
+            frame,
+            variable=self.progress_var,
+            maximum=100,
+            mode="determinate",
+        )
+        self.progress_bar.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        ttk.Label(frame, textvariable=self.status_var, wraplength=600).grid(row=4, column=0, columnspan=3, sticky="w")
 
         ttk.Label(
             frame,
             text="仅复制新增或已修改的文件；不会删除 B 中已有的其他文件。",
             foreground="#555555",
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def _choose_folder(self, variable: tk.StringVar) -> None:
         selected = filedialog.askdirectory(initialdir=variable.get() or None)
@@ -113,30 +121,35 @@ class BackupApp(tk.Tk):
         self._save_current_settings()
         self.backup_button.state(["disabled"])
         self.status_var.set("正在备份…")
+        self.progress_var.set(0)
         threading.Thread(target=self._backup_worker, args=(source, destination), daemon=True).start()
 
     def _backup_worker(self, source: Path, destination: Path) -> None:
         copied = skipped = errors = 0
         try:
-            destination.mkdir(parents=True, exist_ok=True)
+            files_to_process = []
             for directory, _, files in os.walk(source):
                 current_dir = Path(directory)
-                relative_dir = current_dir.relative_to(source)
-                target_dir = destination / relative_dir
-                target_dir.mkdir(parents=True, exist_ok=True)
                 for filename in files:
-                    source_file = current_dir / filename
-                    target_file = target_dir / filename
-                    try:
-                        # A shallow comparison is sufficient for normal incremental backups:
-                        # size or modification time changes cause a fresh copy.
-                        if target_file.exists() and filecmp.cmp(source_file, target_file, shallow=True):
-                            skipped += 1
-                        else:
-                            shutil.copy2(source_file, target_file)
-                            copied += 1
-                    except OSError:
-                        errors += 1
+                    files_to_process.append((current_dir / filename, current_dir.relative_to(source) / filename))
+
+            total = len(files_to_process)
+            self.after(0, self._begin_progress, total)
+            destination.mkdir(parents=True, exist_ok=True)
+            for index, (source_file, relative_path) in enumerate(files_to_process, start=1):
+                target_file = destination / relative_path
+                try:
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    # A shallow comparison is sufficient for normal incremental backups:
+                    # size or modification time changes cause a fresh copy.
+                    if target_file.exists() and filecmp.cmp(source_file, target_file, shallow=True):
+                        skipped += 1
+                    else:
+                        shutil.copy2(source_file, target_file)
+                        copied += 1
+                except OSError:
+                    errors += 1
+                self.after(0, self._update_progress, index, total)
             text = f"备份完成：复制 {copied} 个文件，跳过 {skipped} 个未变化文件"
             if errors:
                 text += f"，{errors} 个文件失败。"
@@ -145,6 +158,15 @@ class BackupApp(tk.Tk):
         except OSError as error:
             text = f"备份失败：{error}"
         self.after(0, self._finish_backup, text)
+
+    def _begin_progress(self, total: int) -> None:
+        if total == 0:
+            self.progress_var.set(100)
+        self.status_var.set(f"正在备份… 共 {total} 个文件")
+
+    def _update_progress(self, done: int, total: int) -> None:
+        self.progress_var.set(done * 100 / total if total else 100)
+        self.status_var.set(f"正在备份… {done}/{total} 个文件")
 
     def _finish_backup(self, text: str) -> None:
         self.status_var.set(text)
