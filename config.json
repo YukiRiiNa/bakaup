@@ -2,5 +2,7 @@
   "source": "D:/Tools/bakaup/A",
   "destination": "D:/Tools/bakaup/B",
   "schedule_enabled": false,
-  "schedule_time": "02:00"
+  "schedule_mode": "interval",
+  "schedule_time": "02:00",
+  "schedule_interval_hours": "1"
 }

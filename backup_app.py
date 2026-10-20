@@ -25,7 +25,9 @@ class Settings:
     source: str = ""
     destination: str = ""
     schedule_enabled: bool = False
+    schedule_mode: str = "daily"
     schedule_time: str = "02:00"
+    schedule_interval_hours: str = "1"
 
 
 def load_settings() -> Settings:
@@ -35,7 +37,9 @@ def load_settings() -> Settings:
             source=str(data.get("source", "")),
             destination=str(data.get("destination", "")),
             schedule_enabled=bool(data.get("schedule_enabled", False)),
+            schedule_mode=str(data.get("schedule_mode", "daily")),
             schedule_time=str(data.get("schedule_time", "02:00")),
+            schedule_interval_hours=str(data.get("schedule_interval_hours", "1")),
         )
     except (OSError, json.JSONDecodeError, TypeError):
         return Settings()
@@ -50,18 +54,23 @@ class BackupApp(tk.Tk):
         super().__init__()
         self.title("增量文件夹备份")
         self.resizable(True, True)
-        self.minsize(650, 430)
+        self.minsize(650, 460)
         settings = load_settings()
         self.source_var = tk.StringVar(value=settings.source)
         self.destination_var = tk.StringVar(value=settings.destination)
         self.schedule_enabled_var = tk.BooleanVar(value=settings.schedule_enabled)
+        self.schedule_mode_var = tk.StringVar(value=settings.schedule_mode)
         self.schedule_time_var = tk.StringVar(value=settings.schedule_time)
-        self.status_var = tk.StringVar(value="请选择源文件夹和备份文件夹。")
+        self.schedule_interval_hours_var = tk.StringVar(value=settings.schedule_interval_hours)
+        self.schedule_summary_var = tk.StringVar()
+        self.backup_status_var = tk.StringVar(value="请选择源文件夹和备份文件夹。")
+        self.schedule_status_var = tk.StringVar(value="定时备份未启用。")
         self.progress_var = tk.DoubleVar(value=0)
         self.backup_running = False
         self.schedule_after_id: str | None = None
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._update_schedule_summary()
         self._schedule_next_backup()
 
     def _build_ui(self) -> None:
@@ -70,7 +79,7 @@ class BackupApp(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
-        frame.rowconfigure(7, weight=1)
+        frame.rowconfigure(8, weight=1)
 
         ttk.Label(frame, text="源文件夹 A：").grid(row=0, column=0, sticky="w", pady=(0, 10))
         ttk.Entry(frame, textvariable=self.source_var).grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=(0, 10))
@@ -89,26 +98,26 @@ class BackupApp(tk.Tk):
             variable=self.schedule_enabled_var,
             command=self._on_schedule_enabled_changed,
         ).grid(row=3, column=0, sticky="w", pady=(0, 8))
-        self.schedule_summary = ttk.Label(frame, textvariable=self.schedule_time_var)
-        self.schedule_summary.grid(row=3, column=1, sticky="w", padx=(8, 8), pady=(0, 8))
-        ttk.Label(frame, text="每天执行").grid(row=3, column=2, sticky="w", pady=(0, 8))
+        self.schedule_summary = ttk.Label(frame, textvariable=self.schedule_summary_var)
+        self.schedule_summary.grid(row=3, column=1, columnspan=2, sticky="w", padx=(8, 8), pady=(0, 8))
         self.progress_bar = ttk.Progressbar(
             frame,
             variable=self.progress_var,
             maximum=100,
             mode="determinate",
         )
-        self.progress_bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        ttk.Label(frame, textvariable=self.status_var, wraplength=600).grid(row=5, column=0, columnspan=3, sticky="w")
-        ttk.Label(frame, text="执行日志：").grid(row=6, column=0, columnspan=3, sticky="w", pady=(12, 4))
+        ttk.Label(frame, textvariable=self.schedule_status_var, wraplength=600).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self.progress_bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        ttk.Label(frame, textvariable=self.backup_status_var, wraplength=600).grid(row=6, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, text="执行日志：").grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 4))
         self.log_text = scrolledtext.ScrolledText(frame, height=8, wrap="word", state="disabled")
-        self.log_text.grid(row=7, column=0, columnspan=3, sticky="nsew")
+        self.log_text.grid(row=8, column=0, columnspan=3, sticky="nsew")
 
         ttk.Label(
             frame,
             text="仅复制新增或已修改的文件；不会删除 B 中已有的其他文件。",
             foreground="#555555",
-        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def _choose_folder(self, variable: tk.StringVar) -> None:
         selected = filedialog.askdirectory(initialdir=variable.get() or None)
@@ -123,11 +132,13 @@ class BackupApp(tk.Tk):
                     source=self.source_var.get().strip(),
                     destination=self.destination_var.get().strip(),
                     schedule_enabled=self.schedule_enabled_var.get(),
+                    schedule_mode=self.schedule_mode_var.get(),
                     schedule_time=self.schedule_time_var.get().strip(),
+                    schedule_interval_hours=self.schedule_interval_hours_var.get().strip(),
                 )
             )
         except OSError as error:
-            self.status_var.set(f"无法保存设置：{error}")
+            self.backup_status_var.set(f"无法保存设置：{error}")
 
     def _start_backup(self, show_errors: bool = True) -> bool:
         if self.backup_running:
@@ -158,7 +169,7 @@ class BackupApp(tk.Tk):
         self._save_current_settings()
         self.backup_running = True
         self.backup_button.state(["disabled"])
-        self.status_var.set("正在备份…")
+        self.backup_status_var.set("正在备份…")
         self.progress_var.set(0)
         self._append_log(f"开始备份：{source} → {destination}")
         threading.Thread(target=self._backup_worker, args=(source, destination), daemon=True).start()
@@ -168,7 +179,7 @@ class BackupApp(tk.Tk):
         if show_dialog:
             messagebox.showerror("无法开始", text)
         else:
-            self.status_var.set(f"定时备份未执行：{text}")
+            self.backup_status_var.set(f"定时备份未执行：{text}")
 
     def _backup_worker(self, source: Path, destination: Path) -> None:
         copied = skipped = errors = 0
@@ -210,14 +221,14 @@ class BackupApp(tk.Tk):
     def _begin_progress(self, total: int) -> None:
         if total == 0:
             self.progress_var.set(100)
-        self.status_var.set(f"正在备份… 共 {total} 个文件")
+        self.backup_status_var.set(f"正在备份… 共 {total} 个文件")
 
     def _update_progress(self, done: int, total: int) -> None:
         self.progress_var.set(done * 100 / total if total else 100)
-        self.status_var.set(f"正在备份… {done}/{total} 个文件")
+        self.backup_status_var.set(f"正在备份… {done}/{total} 个文件")
 
     def _finish_backup(self, text: str) -> None:
-        self.status_var.set(text)
+        self.backup_status_var.set(text)
         self._append_log(text)
         self.backup_running = False
         self.backup_button.state(["!disabled"])
@@ -242,22 +253,50 @@ class BackupApp(tk.Tk):
 
         frame = ttk.Frame(dialog, padding=16)
         frame.grid(sticky="nsew")
+        mode_var = tk.StringVar(value=self.schedule_mode_var.get())
         time_var = tk.StringVar(value=self.schedule_time_var.get())
-        ttk.Label(frame, text="定时执行时间：").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=time_var, width=10).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(frame, text="格式：HH:MM，例如 23:30").grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 16))
+        interval_var = tk.StringVar(value=self.schedule_interval_hours_var.get())
+        ttk.Label(frame, text="定时方式：").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ttk.Radiobutton(frame, text="每天固定时间", variable=mode_var, value="daily").grid(row=0, column=1, sticky="w", pady=(0, 8))
+        ttk.Radiobutton(frame, text="每隔指定小时", variable=mode_var, value="interval").grid(row=0, column=2, sticky="w", pady=(0, 8))
+
+        ttk.Label(frame, text="每日执行时间：").grid(row=1, column=0, sticky="w")
+        time_entry = ttk.Entry(frame, textvariable=time_var, width=10)
+        time_entry.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(frame, text="格式：HH:MM，例如 23:30").grid(row=1, column=2, sticky="w", padx=(8, 0))
+
+        ttk.Label(frame, text="间隔小时数：").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        interval_entry = ttk.Entry(frame, textvariable=interval_var, width=10)
+        interval_entry.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        ttk.Label(frame, text="例如 2 表示每 2 小时执行一次").grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(10, 0))
+
+        def update_mode_controls(*_args: object) -> None:
+            daily = mode_var.get() == "daily"
+            time_entry.state(["!disabled"] if daily else ["disabled"])
+            interval_entry.state(["disabled"] if daily else ["!disabled"])
+
+        mode_var.trace_add("write", update_mode_controls)
+        update_mode_controls()
 
         def save_schedule() -> None:
+            mode = mode_var.get()
             schedule_time = time_var.get().strip()
-            if not self._is_valid_schedule_time(schedule_time):
+            interval_hours = interval_var.get().strip()
+            if mode == "daily" and not self._is_valid_schedule_time(schedule_time):
                 messagebox.showerror("时间格式错误", "请输入 00:00 到 23:59 之间的时间。", parent=dialog)
                 return
+            if mode == "interval" and not self._is_valid_interval_hours(interval_hours):
+                messagebox.showerror("间隔时间错误", "请输入 1 到 500 之间的整数小时数。", parent=dialog)
+                return
+            self.schedule_mode_var.set(mode)
             self.schedule_time_var.set(schedule_time)
+            self.schedule_interval_hours_var.set(interval_hours)
+            self._update_schedule_summary()
             self._save_current_settings()
             self._schedule_next_backup()
             dialog.destroy()
 
-        ttk.Button(frame, text="保存", command=save_schedule).grid(row=2, column=1, sticky="e")
+        ttk.Button(frame, text="保存", command=save_schedule).grid(row=3, column=2, sticky="e", pady=(18, 0))
 
     @staticmethod
     def _is_valid_schedule_time(value: str) -> bool:
@@ -267,12 +306,31 @@ class BackupApp(tk.Tk):
             return False
         return True
 
+    @staticmethod
+    def _is_valid_interval_hours(value: str) -> bool:
+        try:
+            hours = int(value)
+        except ValueError:
+            return False
+        return 1 <= hours <= 500
+
+    def _update_schedule_summary(self) -> None:
+        if self.schedule_mode_var.get() == "interval":
+            self.schedule_summary_var.set(f"每隔 {self.schedule_interval_hours_var.get()} 小时执行")
+        else:
+            self.schedule_summary_var.set(f"每天 {self.schedule_time_var.get()} 执行")
+
     def _on_schedule_enabled_changed(self) -> None:
-        if self.schedule_enabled_var.get() and not self._is_valid_schedule_time(self.schedule_time_var.get().strip()):
+        mode = self.schedule_mode_var.get()
+        invalid_daily = mode == "daily" and not self._is_valid_schedule_time(self.schedule_time_var.get().strip())
+        invalid_interval = mode == "interval" and not self._is_valid_interval_hours(self.schedule_interval_hours_var.get().strip())
+        if self.schedule_enabled_var.get() and (invalid_daily or invalid_interval):
             self.schedule_enabled_var.set(False)
-            messagebox.showerror("时间格式错误", "请先在设置中填写正确的定时执行时间。")
+            messagebox.showerror("定时设置错误", "请先在设置中填写正确的定时规则。")
         self._save_current_settings()
         self._schedule_next_backup()
+        if not self.schedule_enabled_var.get():
+            self.schedule_status_var.set("定时备份已关闭。")
 
     def _schedule_next_backup(self) -> None:
         if self.schedule_after_id is not None:
@@ -281,27 +339,43 @@ class BackupApp(tk.Tk):
         if not self.schedule_enabled_var.get():
             return
 
-        schedule_time = self.schedule_time_var.get().strip()
-        if not self._is_valid_schedule_time(schedule_time):
+        mode = self.schedule_mode_var.get()
+        if mode not in {"daily", "interval"}:
+            mode = "daily"
+            self.schedule_mode_var.set(mode)
+
+        if mode == "daily" and not self._is_valid_schedule_time(self.schedule_time_var.get().strip()):
             self.schedule_enabled_var.set(False)
             self._save_current_settings()
-            self.status_var.set("定时备份未启用：时间格式无效。")
+            self.schedule_status_var.set("定时备份未启用：时间格式无效。")
             return
-
-        hour, minute = map(int, schedule_time.split(":"))
         now = datetime.now()
-        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if next_run <= now:
-            next_run += timedelta(days=1)
+        if mode == "daily":
+            hour, minute = map(int, self.schedule_time_var.get().strip().split(":"))
+            next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if next_run <= now:
+                next_run += timedelta(days=1)
+            schedule_description = f"每天 {self.schedule_time_var.get().strip()}"
+        else:
+            interval_hours = self.schedule_interval_hours_var.get().strip()
+            if not self._is_valid_interval_hours(interval_hours):
+                self.schedule_enabled_var.set(False)
+                self._save_current_settings()
+                self.schedule_status_var.set("定时备份未启用：间隔小时数无效。")
+                return
+            next_run = now + timedelta(hours=int(interval_hours))
+            schedule_description = f"每隔 {interval_hours} 小时"
+
         delay_ms = int((next_run - now).total_seconds() * 1000)
         self.schedule_after_id = self.after(delay_ms, self._run_scheduled_backup)
-        self.status_var.set(f"定时备份已启用：将在 {next_run:%Y-%m-%d %H:%M} 执行。")
+        self._update_schedule_summary()
+        self.schedule_status_var.set(f"定时备份已启用：{schedule_description}，下次在 {next_run:%Y-%m-%d %H:%M} 执行。")
 
     def _run_scheduled_backup(self) -> None:
         self.schedule_after_id = None
         self._schedule_next_backup()
         if self.backup_running:
-            self.status_var.set("定时备份跳过：已有备份任务正在执行。")
+            self.schedule_status_var.set("定时备份跳过：已有备份任务正在执行。")
             return
         self._start_backup(show_errors=False)
 
