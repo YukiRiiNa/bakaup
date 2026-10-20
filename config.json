@@ -1,4 +1,6 @@
 {
   "source": "D:/Tools/bakaup/A",
-  "destination": "D:/Tools/bakaup/B"
+  "destination": "D:/Tools/bakaup/B",
+  "schedule_enabled": false,
+  "schedule_time": "02:00"
 }

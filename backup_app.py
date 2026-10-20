@@ -11,9 +11,10 @@ import os
 import shutil
 import threading
 import tkinter as tk
+from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 
 SETTINGS_FILE = Path(__file__).resolve().parent / "config.json"
@@ -23,12 +24,19 @@ SETTINGS_FILE = Path(__file__).resolve().parent / "config.json"
 class Settings:
     source: str = ""
     destination: str = ""
+    schedule_enabled: bool = False
+    schedule_time: str = "02:00"
 
 
 def load_settings() -> Settings:
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        return Settings(**{key: data.get(key, "") for key in ("source", "destination")})
+        return Settings(
+            source=str(data.get("source", "")),
+            destination=str(data.get("destination", "")),
+            schedule_enabled=bool(data.get("schedule_enabled", False)),
+            schedule_time=str(data.get("schedule_time", "02:00")),
+        )
     except (OSError, json.JSONDecodeError, TypeError):
         return Settings()
 
@@ -41,21 +49,28 @@ class BackupApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("增量文件夹备份")
-        self.resizable(True, False)
-        self.minsize(650, 240)
+        self.resizable(True, True)
+        self.minsize(650, 430)
         settings = load_settings()
         self.source_var = tk.StringVar(value=settings.source)
         self.destination_var = tk.StringVar(value=settings.destination)
+        self.schedule_enabled_var = tk.BooleanVar(value=settings.schedule_enabled)
+        self.schedule_time_var = tk.StringVar(value=settings.schedule_time)
         self.status_var = tk.StringVar(value="请选择源文件夹和备份文件夹。")
         self.progress_var = tk.DoubleVar(value=0)
+        self.backup_running = False
+        self.schedule_after_id: str | None = None
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._schedule_next_backup()
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self, padding=16)
         frame.grid(sticky="nsew")
         self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(7, weight=1)
 
         ttk.Label(frame, text="源文件夹 A：").grid(row=0, column=0, sticky="w", pady=(0, 10))
         ttk.Entry(frame, textvariable=self.source_var).grid(row=0, column=1, sticky="ew", padx=(8, 8), pady=(0, 10))
@@ -67,20 +82,33 @@ class BackupApp(tk.Tk):
 
         self.backup_button = ttk.Button(frame, text="开始增量备份", command=self._start_backup)
         self.backup_button.grid(row=2, column=1, sticky="e", pady=(8, 14))
+        ttk.Button(frame, text="设置", command=self._open_settings).grid(row=2, column=2, pady=(8, 14))
+        ttk.Checkbutton(
+            frame,
+            text="启用定时备份",
+            variable=self.schedule_enabled_var,
+            command=self._on_schedule_enabled_changed,
+        ).grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.schedule_summary = ttk.Label(frame, textvariable=self.schedule_time_var)
+        self.schedule_summary.grid(row=3, column=1, sticky="w", padx=(8, 8), pady=(0, 8))
+        ttk.Label(frame, text="每天执行").grid(row=3, column=2, sticky="w", pady=(0, 8))
         self.progress_bar = ttk.Progressbar(
             frame,
             variable=self.progress_var,
             maximum=100,
             mode="determinate",
         )
-        self.progress_bar.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        ttk.Label(frame, textvariable=self.status_var, wraplength=600).grid(row=4, column=0, columnspan=3, sticky="w")
+        self.progress_bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        ttk.Label(frame, textvariable=self.status_var, wraplength=600).grid(row=5, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, text="执行日志：").grid(row=6, column=0, columnspan=3, sticky="w", pady=(12, 4))
+        self.log_text = scrolledtext.ScrolledText(frame, height=8, wrap="word", state="disabled")
+        self.log_text.grid(row=7, column=0, columnspan=3, sticky="nsew")
 
         ttk.Label(
             frame,
             text="仅复制新增或已修改的文件；不会删除 B 中已有的其他文件。",
             foreground="#555555",
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def _choose_folder(self, variable: tk.StringVar) -> None:
         selected = filedialog.askdirectory(initialdir=variable.get() or None)
@@ -90,39 +118,57 @@ class BackupApp(tk.Tk):
 
     def _save_current_settings(self) -> None:
         try:
-            save_settings(Settings(self.source_var.get().strip(), self.destination_var.get().strip()))
+            save_settings(
+                Settings(
+                    source=self.source_var.get().strip(),
+                    destination=self.destination_var.get().strip(),
+                    schedule_enabled=self.schedule_enabled_var.get(),
+                    schedule_time=self.schedule_time_var.get().strip(),
+                )
+            )
         except OSError as error:
             self.status_var.set(f"无法保存设置：{error}")
 
-    def _start_backup(self) -> None:
+    def _start_backup(self, show_errors: bool = True) -> bool:
+        if self.backup_running:
+            return False
         source_text = self.source_var.get().strip()
         destination_text = self.destination_var.get().strip()
         source = Path(source_text).expanduser()
         destination = Path(destination_text).expanduser()
         if not source.is_dir():
-            messagebox.showerror("无法开始", "请选择一个存在的源文件夹 A。")
-            return
+            self._show_start_error("请选择一个存在的源文件夹 A。", show_errors)
+            return False
         if not destination_text:
-            messagebox.showerror("无法开始", "请选择备份文件夹 B。")
-            return
+            self._show_start_error("请选择备份文件夹 B。", show_errors)
+            return False
         try:
             source.resolve().relative_to(destination.resolve())
-            messagebox.showerror("无法开始", "备份文件夹 B 不能是源文件夹 A 的上级目录或其自身。")
-            return
+            self._show_start_error("备份文件夹 B 不能是源文件夹 A 的上级目录或其自身。", show_errors)
+            return False
         except ValueError:
             pass
         try:
             destination.resolve().relative_to(source.resolve())
-            messagebox.showerror("无法开始", "备份文件夹 B 不能位于源文件夹 A 内。")
-            return
+            self._show_start_error("备份文件夹 B 不能位于源文件夹 A 内。", show_errors)
+            return False
         except ValueError:
             pass
 
         self._save_current_settings()
+        self.backup_running = True
         self.backup_button.state(["disabled"])
         self.status_var.set("正在备份…")
         self.progress_var.set(0)
+        self._append_log(f"开始备份：{source} → {destination}")
         threading.Thread(target=self._backup_worker, args=(source, destination), daemon=True).start()
+        return True
+
+    def _show_start_error(self, text: str, show_dialog: bool) -> None:
+        if show_dialog:
+            messagebox.showerror("无法开始", text)
+        else:
+            self.status_var.set(f"定时备份未执行：{text}")
 
     def _backup_worker(self, source: Path, destination: Path) -> None:
         copied = skipped = errors = 0
@@ -147,8 +193,10 @@ class BackupApp(tk.Tk):
                     else:
                         shutil.copy2(source_file, target_file)
                         copied += 1
+                        self._queue_log(f"已备份：{relative_path}")
                 except OSError:
                     errors += 1
+                    self._queue_log(f"备份失败：{relative_path}")
                 self.after(0, self._update_progress, index, total)
             text = f"备份完成：复制 {copied} 个文件，跳过 {skipped} 个未变化文件"
             if errors:
@@ -170,9 +218,96 @@ class BackupApp(tk.Tk):
 
     def _finish_backup(self, text: str) -> None:
         self.status_var.set(text)
+        self._append_log(text)
+        self.backup_running = False
         self.backup_button.state(["!disabled"])
 
+    def _queue_log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.after(0, self._append_log, message, timestamp)
+
+    def _append_log(self, message: str, timestamp: str | None = None) -> None:
+        timestamp = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"[{timestamp}] {message}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _open_settings(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("设置")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.grid(sticky="nsew")
+        time_var = tk.StringVar(value=self.schedule_time_var.get())
+        ttk.Label(frame, text="定时执行时间：").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=time_var, width=10).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(frame, text="格式：HH:MM，例如 23:30").grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 16))
+
+        def save_schedule() -> None:
+            schedule_time = time_var.get().strip()
+            if not self._is_valid_schedule_time(schedule_time):
+                messagebox.showerror("时间格式错误", "请输入 00:00 到 23:59 之间的时间。", parent=dialog)
+                return
+            self.schedule_time_var.set(schedule_time)
+            self._save_current_settings()
+            self._schedule_next_backup()
+            dialog.destroy()
+
+        ttk.Button(frame, text="保存", command=save_schedule).grid(row=2, column=1, sticky="e")
+
+    @staticmethod
+    def _is_valid_schedule_time(value: str) -> bool:
+        try:
+            datetime.strptime(value, "%H:%M")
+        except ValueError:
+            return False
+        return True
+
+    def _on_schedule_enabled_changed(self) -> None:
+        if self.schedule_enabled_var.get() and not self._is_valid_schedule_time(self.schedule_time_var.get().strip()):
+            self.schedule_enabled_var.set(False)
+            messagebox.showerror("时间格式错误", "请先在设置中填写正确的定时执行时间。")
+        self._save_current_settings()
+        self._schedule_next_backup()
+
+    def _schedule_next_backup(self) -> None:
+        if self.schedule_after_id is not None:
+            self.after_cancel(self.schedule_after_id)
+            self.schedule_after_id = None
+        if not self.schedule_enabled_var.get():
+            return
+
+        schedule_time = self.schedule_time_var.get().strip()
+        if not self._is_valid_schedule_time(schedule_time):
+            self.schedule_enabled_var.set(False)
+            self._save_current_settings()
+            self.status_var.set("定时备份未启用：时间格式无效。")
+            return
+
+        hour, minute = map(int, schedule_time.split(":"))
+        now = datetime.now()
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        delay_ms = int((next_run - now).total_seconds() * 1000)
+        self.schedule_after_id = self.after(delay_ms, self._run_scheduled_backup)
+        self.status_var.set(f"定时备份已启用：将在 {next_run:%Y-%m-%d %H:%M} 执行。")
+
+    def _run_scheduled_backup(self) -> None:
+        self.schedule_after_id = None
+        self._schedule_next_backup()
+        if self.backup_running:
+            self.status_var.set("定时备份跳过：已有备份任务正在执行。")
+            return
+        self._start_backup(show_errors=False)
+
     def _on_close(self) -> None:
+        if self.schedule_after_id is not None:
+            self.after_cancel(self.schedule_after_id)
         self._save_current_settings()
         self.destroy()
 
